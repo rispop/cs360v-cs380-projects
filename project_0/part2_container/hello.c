@@ -13,7 +13,7 @@
 
 int main(void)
 {
-    int pid = 0;
+    int pid = getpid();
     /* TODO(student): set `pid` to this process's id with getpid(). */
 
     printf("%d\n", pid);
