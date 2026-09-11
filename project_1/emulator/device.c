@@ -77,6 +77,26 @@ uint64_t vlog_device_mmio_read(uc_engine *uc, uint64_t offset,
     /* TODO(student): return the 32-bit value of the register at `offset`
      * (relative to DEV_BASE): ID, VERSION, STATUS, MSG_LO, MSG_HI, LEN, LEVEL,
      * SEQ. Return 0 for any other offset. See SPEC.md §2. */
+
+    switch (offset) {
+        case VLOG_REG_ID: return VLOG_MAGIC;
+        
+        case VLOG_REG_VERSION: return VLOG_VERSION;
+        
+        case VLOG_REG_STATUS: return dev->status;
+        
+        case VLOG_REG_MSG_LO: return dev->msg_addr_lo;
+
+        case VLOG_REG_MSG_HI: return dev->msg_addr_hi;
+
+        case VLOG_REG_LEN: return dev->len;
+        
+        case VLOG_REG_LEVEL: return dev->level;
+
+        case VLOG_REG_SEQ: return dev->seq;
+
+        default: return 0;
+    }
     return 0;
 }
 
@@ -110,4 +130,54 @@ void vlog_device_mmio_write(uc_engine *uc, uint64_t offset,
      *       other: set_error(VLOG_ERR_BADCMD);
      *   - read-only registers and unknown offsets: ignore the write.
      * See SPEC.md §3 (errors) and §4 (commands). */
+
+     switch (offset) {
+        case VLOG_REG_MSG_LO:
+            dev->msg_addr_lo = (uint32_t) value;
+            break;
+
+        case VLOG_REG_MSG_HI:
+            dev->msg_addr_hi = (uint32_t) value;
+            break;
+
+        case VLOG_REG_LEN:
+            dev->len = (uint32_t) value;
+            break;
+        
+        
+        case VLOG_REG_LEVEL:
+            dev->level = (uint32_t) value;
+            break;
+
+        case VLOG_REG_CMD:
+            // sub cases
+            // TODO
+            switch(value) {
+                case VLOG_CMD_NOP:
+                    clear_error(dev);
+                    break;
+
+                case VLOG_CMD_LOG:
+                    if(dev->len == 0){
+                        // TODO check res as error
+                        logstore_append(dev->vmm->store, dev->seq, dev->level, "", 0);
+                    }
+                    if(dev->len < VLOG_MAX_MSG && dev->len > 0) {
+                        logstore_append(dev->vmm->store, dev->seq, dev->level, (void*)msg_addr(dev), dev->len);
+                    }
+                    if(dev->len > VLOG_MAX_MSG && dev->len > 0){
+                        set_error(dev, VLOG_ERR_BADLEN);
+                    }
+                    break;
+                case VLOG_CMD_FLUSH:
+                    logstore_flush(dev->vmm->store);
+                    break;
+                
+                case VLOG_CMD_STAT:
+                break;
+            }
+    }
+
+    
+     
 }

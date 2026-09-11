@@ -47,7 +47,21 @@ static inline void serial_write(uc_engine *uc, uint64_t offset,
      *                             powered off, and stop the CPU (uc_emu_stop).
      *   - anything else:          ignore. */
 
-    // *(SERIAL_BASE + offset) = value; 
+    switch(offset){
+        case SERIAL_TX:
+            // TODO what do we do for an error in putchar (EOF)
+            int err_val = putchar(value);
+            if (err_val == EOF) {
+                return;
+            }
+            break;
+        case SERIAL_POWEROFF:
+            v->exit_code = (int)value;
+            v->powered_off = 1;
+            uc_emu_stop(uc);
+            break;
+    }
+
 }
 
 /* ---- Guest memory faults ---------------------------------------------- */
@@ -64,6 +78,13 @@ static inline bool mem_invalid(uc_engine *uc, uc_mem_type type, uint64_t address
                                int size, int64_t value, void *user_data)
 {
     (void)uc; (void)type; (void)address; (void)size; (void)value; (void)user_data;
+
+    struct vmm *v = (struct vmm*) user_data;
+    v->faulted = 1;
+    v->fault_addr = address;
+    fprintf(stderr, "ERROR fault address: %lu \nType of access: %d", address, type);
+    uc_emu_stop(uc);
+    // TODO might have to return this VMM_EXIT_FAULT
     return false;
 }
 
@@ -98,6 +119,11 @@ int vmm_create(struct vmm *v, int trace, const char *log_path)
         return -1;
     }
 
+    v->ram = calloc(1, RAM_SIZE);
+    if (!v->ram) {
+        return -1;
+    }
+
     /* TODO(student): allocate RAM_SIZE bytes of zeroed guest RAM into v->ram,
      * and map it into the guest at RAM_BASE with uc_mem_map_ptr (host-backed,
      * UC_PROT_ALL) so the device can translate guest addresses to host
@@ -109,7 +135,13 @@ int vmm_create(struct vmm *v, int trace, const char *log_path)
     /* TODO(student): register the serial/control MMIO region at SERIAL_BASE
      * (size SERIAL_SIZE) with uc_mmio_map, using serial_read / serial_write and
      * `v` as the user_data for both. */
-    if (uc_mmio_map(v->uc, SERIAL_BASE, SERIAL_SIZE, vlog_device_mmio_read, v, vlog_device_mmio_write, v->dev) != UC_ERR_OK) {
+    if (uc_mmio_map(v->uc,
+        SERIAL_BASE,
+        SERIAL_SIZE,
+        serial_read,
+        v,
+        serial_write,
+        v) != UC_ERR_OK) {
         return -1;
     }
 
@@ -125,12 +157,24 @@ int vmm_create(struct vmm *v, int trace, const char *log_path)
     /* TODO(student): register the logging device's MMIO region at DEV_BASE
      * (size DEV_SIZE) with uc_mmio_map, using vlog_device_mmio_read /
      * vlog_device_mmio_write and v->dev as the user_data for both. */
-    uc_mmio_map();
+    
+    if (uc_mmio_map(v->uc,
+        DEV_BASE,
+        DEV_SIZE,
+        vlog_device_mmio_read,
+        v->dev,
+        vlog_device_mmio_write,
+        v->dev) != UC_ERR_OK) {
+        return -1;
+    }
 
     /* TODO(student): set the initial stack pointer. RSP goes just below the
      * reserved boot-info region (BOOTINFO_BASE), 16-byte aligned, via
      * uc_reg_write(UC_X86_REG_RSP, ...). The guest needs a stack to run. */
-    uc_reg_write(v->uc, UC_X86_REG_RSP, &rsp)
+    uint64_t rsp = BOOTINFO_BASE - 16;
+    uc_reg_write(v->uc, UC_X86_REG_RSP, &rsp);
+    
+
     
     /* provided: boot-parameter pointer. The guest receives BOOTINFO_BASE in
      * RDI (its main()'s first argument). Leave this as-is. */
@@ -141,6 +185,9 @@ int vmm_create(struct vmm *v, int trace, const char *log_path)
      * uc_hook_add(..., UC_HOOK_MEM_UNMAPPED, mem_invalid, v, 1, 0) so a guest
      * that touches unmapped memory faults cleanly instead of taking the
      * emulator down with it. */
+    uc_hook h;
+    uc_hook_add(v->uc, &h, UC_HOOK_MEM_UNMAPPED, mem_invalid, v, 1, 0);
+
 
     /* provided: optional instruction tracing (--trace) */
     if (trace) {
@@ -149,7 +196,6 @@ int vmm_create(struct vmm *v, int trace, const char *log_path)
                     RAM_BASE, RAM_BASE + RAM_SIZE - 1);
     }
 
-    
     return 0;
 }
 
@@ -160,7 +206,45 @@ int vmm_load_binary(struct vmm *v, const char *path)
      * starting at v->ram (offset 0 == RAM_BASE), rejecting a file larger than
      * RAM_SIZE, then set the initial RIP to RAM_BASE (the entry point) with
      * uc_reg_write(UC_X86_REG_RIP, ...). Return 0 on success, -1 on error. */
-    return -1;
+    
+    FILE* fp = fopen(path, "rb");
+    if (fp == NULL) {
+        return -1;
+    }
+
+    // Size calculation
+    if(fseek(fp, 0L, SEEK_END) != 0){
+        return -1; 
+    }
+
+    uint64_t size = ftell(fp);
+
+    if(size > RAM_SIZE){
+        return -1;
+    }
+
+    // Write into memory 
+
+    // Put it back to the beginning 
+    if(fseek(fp, 0L, SEEK_SET) != 0){
+        return -1; 
+    }
+    
+    // Read all the bytes
+    size_t bytes_read = fread(v->ram, 1, size, fp);
+    if (bytes_read != size) {
+        return -1;
+    }
+
+    // Writing the instruction pointer 
+    uint64_t rip = RAM_BASE;
+    if (uc_reg_write(v->uc, UC_X86_REG_RIP, &rip) != UC_ERR_OK) {
+        return -1;
+    }
+    
+    fclose(fp);
+    
+    return 0;
 }
 
 /* provided: boot-parameter blob loader (used by the test harness via
@@ -199,7 +283,17 @@ int vmm_run(struct vmm *v)
      *   - if the guest FAULTED (v->faulted), return VMM_EXIT_FAULT;
      *   - a Unicorn error while NOT powered off is a failure (return non-zero);
      *   - otherwise return v->exit_code. */
-    return 1;
+
+    uc_err err = uc_emu_start(v->uc, RAM_BASE, 0, 0, 0);
+    if (v->faulted) {
+        return VMM_EXIT_FAULT;
+    }
+    
+    if(err != UC_ERR_OK && !v->powered_off){
+        return -1;
+    }
+    
+    return v->exit_code;
 }
 
 void vmm_destroy(struct vmm *v)
@@ -221,5 +315,15 @@ void *vmm_gpa_to_host(struct vmm *v, uint64_t gpa, uint64_t len)
      * host pointer into v->ram. Return NULL unless the ENTIRE range lies within
      * guest RAM [RAM_BASE, RAM_BASE + RAM_SIZE). Beware integer overflow when
      * checking the upper bound. See SPEC.md Part I, vmm_gpa_to_host. */
-    return NULL;
+    if(gpa < RAM_BASE) {
+        return NULL;
+    }
+    if ((gpa - RAM_BASE) >= RAM_SIZE) {
+        return NULL;
+    }
+    if (len > RAM_SIZE - (gpa - RAM_BASE)) {
+        return NULL;
+    }
+    
+    return v->ram + (gpa - RAM_BASE);
 }
