@@ -134,48 +134,112 @@ void vlog_device_mmio_write(uc_engine *uc, uint64_t offset,
      switch (offset) {
         case VLOG_REG_MSG_LO:
             dev->msg_addr_lo = (uint32_t) value;
+            clear_error(dev);
             break;
 
         case VLOG_REG_MSG_HI:
             dev->msg_addr_hi = (uint32_t) value;
+            clear_error(dev);
             break;
 
         case VLOG_REG_LEN:
             dev->len = (uint32_t) value;
+            clear_error(dev);
             break;
         
         
         case VLOG_REG_LEVEL:
             dev->level = (uint32_t) value;
+            clear_error(dev);
             break;
 
         case VLOG_REG_CMD:
             // sub cases
-            // TODO
             switch(value) {
                 case VLOG_CMD_NOP:
                     clear_error(dev);
                     break;
 
                 case VLOG_CMD_LOG:
-                    if(dev->len == 0){
-                        // TODO check res as error
-                        logstore_append(dev->vmm->store, dev->seq, dev->level, "", 0);
-                    }
-                    if(dev->len < VLOG_MAX_MSG && dev->len > 0) {
-                        logstore_append(dev->vmm->store, dev->seq, dev->level, (void*)msg_addr(dev), dev->len);
-                    }
-                    if(dev->len > VLOG_MAX_MSG && dev->len > 0){
+                    // error cases
+                    if(dev->len > VLOG_MAX_MSG){
                         set_error(dev, VLOG_ERR_BADLEN);
+                        break;
+                    }
+                    // lower bounds check 
+                    // uint64_t addr = (uint64_t)vmm_gpa_to_host(dev->vmm, msg_addr(dev), dev->len);
+                    uint64_t addr = msg_addr(dev);
+                    if (!addr) {
+                        set_error(dev, VLOG_ERR_BADADDR);
+                        break;
+                    }
+
+                    if(dev->len > 0 && (addr < RAM_BASE 
+                        || addr + dev->len < RAM_BASE )){
+                        set_error(dev, VLOG_ERR_BADADDR);
+                        break;
+                    }
+                    // upper bounds check
+                    if(dev->len > 0 && (
+                        addr - RAM_BASE >= RAM_SIZE 
+                        || dev->len > RAM_SIZE - (addr - RAM_BASE))) {
+                        set_error(dev, VLOG_ERR_BADADDR);
+                        break;
+                    }
+
+                    if(dev->len == 0){
+                        logstore_append(dev->vmm->store, dev->seq, dev->level, "", 0);
+                        ++dev->seq;
+                    } else if(dev->len <= VLOG_MAX_MSG && dev->len > 0) {
+                        logstore_append(dev->vmm->store, dev->seq, dev->level, (void*)vmm_gpa_to_host(dev->vmm, msg_addr(dev), dev->len), dev->len);
+                        ++dev->seq;
+                        dev->bytes += dev->len;
                     }
                     break;
                 case VLOG_CMD_FLUSH:
                     logstore_flush(dev->vmm->store);
+                    clear_error(dev);
                     break;
                 
                 case VLOG_CMD_STAT:
-                break;
-            }
+                    if(dev->len < sizeof(struct vlog_stats)){
+                        set_error(dev, VLOG_ERR_BADLEN);
+                        break;
+                    }
+
+                    addr = msg_addr(dev);
+                    // addr = (uint64_t)vmm_gpa_to_host(dev->vmm, msg_addr(dev), dev->len)
+                    if (!addr) {
+                        set_error(dev, VLOG_ERR_BADADDR);
+                        break;
+                    }
+
+                    // Lower bound check
+                    if(addr < RAM_BASE || 
+                    sizeof(struct vlog_stats) + addr < RAM_BASE) {
+                        set_error(dev, VLOG_ERR_BADADDR);
+                        break;
+                    }
+
+                    if(addr - RAM_BASE > RAM_SIZE || 
+                    sizeof(struct vlog_stats) > RAM_SIZE - (addr - RAM_BASE)) {
+                        set_error(dev, VLOG_ERR_BADADDR);
+                        break;
+                    }
+                    
+                    // normal case - write the data into the buffer @ addr
+                    // struct vlog_stats v = {.records = dev->seq, .bytes = dev->bytes};
+                    struct vlog_stats* tmp = (struct vlog_stats*)vmm_gpa_to_host(dev->vmm, msg_addr(dev), dev->len);
+                    tmp->records = dev->seq;
+                    tmp->bytes = dev->bytes;
+                    clear_error(dev);
+                    break;
+                default:
+                    clear_error(dev);
+                    set_error(dev, VLOG_ERR_BADCMD);
+                    break;
+        }
+        break;
     }
 
     
