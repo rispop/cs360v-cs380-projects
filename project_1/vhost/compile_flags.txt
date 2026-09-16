@@ -1,0 +1,3 @@
+-I.
+-I../emulator
+-std=c11

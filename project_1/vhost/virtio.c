@@ -71,6 +71,8 @@
  * See SPEC.md Part III. Develop against `cd tests && ./run_virtq_tests.sh`, then
  * watch it drive a real VM with `cd vhost && ./run-qemu.sh`.
  */
+#include "standard-headers/linux/virtio_ring.h"
+#include "standard-headers/linux/virtio_types.h"
 #include "virtq.h"
 
 #include <string.h>
@@ -89,14 +91,11 @@ void *virtq_gpa_to_hva(const struct virtq_mem *mem, uint64_t gpa, uint64_t len)
         return NULL;
     }
     
-    for (int i = 0; i < mem->nregions; i++) {
+    for (unsigned i = 0; i < mem->nregions; i++) {
         if (gpa >= mem->regions[i].gpa
             && gpa - mem->regions[i].gpa < mem->regions[i].size
             && len <= mem->regions[i].size - (gpa - mem->regions[i].gpa)) {
             uint64_t offset = gpa - mem->regions[i].gpa;
-
-            //return (void*)(mem->regions[i].hva + offset);
-            // uint64_t blah = (uint64_t) mem->regions[i].hva;
             return (char*)mem->regions[i].hva + offset;
            
         } 
@@ -114,5 +113,73 @@ int vlog_virtq_handle(struct virtq *vq, const struct virtq_mem *mem,
 
     /* TODO(student): process every available chain (see the recipe above) and
      * return how many you completed. */
-    return 0;
+   
+   
+    __virtio16 ready_num = vq->avail->idx;
+    int num_chains = 0;
+    
+    // higher loop, we iterate through the available chains
+    while (vq->last_avail != ready_num) {
+        virtq_rmb();
+        __virtio16 head = vq->avail->ring[vq->last_avail % vq->num];
+        
+        char rec[VIRTQ_MAX_RECORD];
+        size_t rec_len = 0;
+
+        // inner loop
+        struct vring_desc* d_table = vq->desc;
+        __virtio32 t_size = vq->num;
+        __virtio16 i = head;
+        int x = 0;
+        while (x < vq->num) {
+            if (i >= t_size) {
+                break;
+            }
+            struct vring_desc* d = &d_table[i];
+            if (d->flags & VRING_DESC_F_INDIRECT) {
+                d_table = (struct vring_desc*)virtq_gpa_to_hva(mem, d->addr, d->len);
+                if (!d_table) {
+                    break;
+                }
+                t_size = d->len / sizeof(struct vring_desc);
+                i = 0;
+                continue;
+            }
+            if (d->flags & VRING_DESC_F_WRITE) {
+                // do nothing 
+            } 
+            else {
+                void * data = virtq_gpa_to_hva(mem, d->addr, d->len);
+                if (data) {
+                    size_t cp_len = d->len;
+                    // cp_len + rec_len > VIRTQ_MAX_RECORD
+                    if (cp_len > VIRTQ_MAX_RECORD - rec_len) {
+                        cp_len = VIRTQ_MAX_RECORD - rec_len;
+                        //probably error here 
+                    }
+                    memcpy(rec + rec_len, data, cp_len);
+                    rec_len += cp_len;
+                }
+            }
+            if (d->flags & VRING_DESC_F_NEXT) {
+                i = d->next;
+                x++;
+            } else {
+                break;
+            }
+        }
+        if (rec_len > 0) {
+            vlog_sink_emit(sink, rec, rec_len);
+        }
+        vq->used->ring[vq->used->idx % vq->num].id = head;
+        vq->used->ring[vq->used->idx % vq->num].len = 0;
+        virtq_wmb();
+        vq->used->idx++;
+        vq->last_avail++;
+        num_chains++;
+    }
+   
+    return num_chains;
 }
+
+
