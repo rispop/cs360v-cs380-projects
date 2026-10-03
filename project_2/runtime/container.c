@@ -22,11 +22,35 @@
 #include <stdio.h>
 #include <sys/ioctl.h>
 #include <net/if.h>
-#include <sys/capability.h>
+#include <linux/capability.h>
+#include <sys/syscall.h>
+#include <sys/prctl.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/stat.h>
+#include <net/route.h>
+#include <sys/wait.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
+#include <sys/mount.h>
+#include <fcntl.h>
+
+#include <stddef.h>
+#include <sys/prctl.h>
+#include <sys/syscall.h>
+#include <linux/audit.h>
+#include <linux/filter.h>
+#include <linux/seccomp.h>
+
+#if defined(__x86_64__)
+#define SECCOMP_ARCH AUDIT_ARCH_X86_64
+#elif defined(__aarch64__)
+#define SECCOMP_ARCH AUDIT_ARCH_AARCH64
+#else
+#error "unsupported architecture for seccomp filter"
+#endif
 
 /* ---- Part I: namespaces ----------------------------------------------- */
 
@@ -95,6 +119,39 @@ int container_cgroup_init(struct container *c)
      *     <cg_path>/memory.max (a value < 0 means the literal string "max"), and
      *     write "0" to <cg_path>/memory.swap.max so hitting the memory cap
      *     OOM-kills instead of swapping. */
+    char path[PATH_MAX + 64];
+    char val[64];
+
+    snprintf(path, sizeof(path), "%s/cgroup.subtree_control", c->cgroup_base);
+    if (write_file(path, "+pids +memory") < 0) return -1;
+
+    snprintf(c->cg_path, sizeof(c->cg_path), "%s/%s", c->cgroup_base, c->name);
+    if (mkdir(c->cg_path, 0755) < 0) {
+        if (errno != EEXIST) {
+            perror("container: mkdir cgroup");
+            return -1;
+        }
+    }
+
+    snprintf(path, sizeof(path), "%s/pids.max", c->cg_path);
+    if (c->pids_max < 0) {
+        if (write_file(path, "max") < 0) return -1;
+    } else {
+        snprintf(val, sizeof(val), "%ld", c->pids_max);
+        if (write_file(path, val) < 0) return -1;
+    }
+
+    snprintf(path, sizeof(path), "%s/memory.max", c->cg_path);
+    if (c->mem_max < 0) {
+        if (write_file(path, "max") < 0) return -1;
+    } else {
+        snprintf(val, sizeof(val), "%ld", c->mem_max);
+        if (write_file(path, val) < 0) return -1;
+    }
+
+    snprintf(path, sizeof(path), "%s/memory.swap.max", c->cg_path);
+    if (write_file(path, "0") < 0) return -1;
+
     return 0;
 }
 
@@ -103,6 +160,15 @@ int container_cgroup_enter(struct container *c, pid_t child)
     (void)c; (void)child;
     /* TODO(student): move `child` into this container's cgroup by writing its
      * pid to <cg_path>/cgroup.procs. */
+    char path[PATH_MAX + 64];
+    char pid_str[32];
+
+    snprintf(path, sizeof(path), "%s/cgroup.procs", c->cg_path);
+    snprintf(pid_str, sizeof(pid_str), "%d", child);
+
+    if (write_file(path, pid_str) < 0) {
+        return -1;
+    }
     return 0;
 }
 
@@ -157,6 +223,64 @@ int container_setup(struct container *c)
         }
     }
 
+    // part 2 stuff
+    char path[PATH_MAX];
+    if (mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) < 0) {
+        perror("mount private");
+        return -1;
+    }
+    if (mount(c->rootfs, c->rootfs, NULL, MS_BIND | MS_REC, NULL) < 0) return -1;
+    if (mount(c->rootfs, c->rootfs, NULL, MS_BIND | MS_REMOUNT | MS_RDONLY, NULL) < 0) return -1;
+
+    snprintf(path, sizeof(path), "%s/tmp", c->rootfs);
+    if (mount("tmpfs", path, "tmpfs", 0, NULL) < 0) return -1;
+
+    snprintf(path, sizeof(path), "%s/dev", c->rootfs);
+    if (mount("tmpfs", path, "tmpfs", 0, NULL) < 0) return -1;
+
+    snprintf(path, sizeof(path), "%s/dev/null", c->rootfs);
+    int fd = open(path, O_CREAT | O_WRONLY, 0666);
+    if (fd >= 0) close(fd);
+    if (mount("/dev/null", path, NULL, MS_BIND, NULL) < 0) return -1;
+
+    snprintf(path, sizeof(path), "%s/dev/zero", c->rootfs);
+    fd = open(path, O_CREAT | O_WRONLY, 0666);
+    if (fd >= 0) close(fd);
+    if (mount("/dev/zero", path, NULL, MS_BIND, NULL) < 0) return -1;
+
+    snprintf(path, sizeof(path), "%s/proc", c->rootfs);
+    if (mount("proc", path, "proc", 0, NULL) < 0) return -1;
+
+    if (chdir(c->rootfs) < 0) return -1;
+    if (syscall(SYS_pivot_root, ".", ".") < 0) {
+        perror("pivot_root");
+        return -1;
+    }
+    if (umount2(".", MNT_DETACH) < 0) return -1;
+    if (chdir("/") < 0) return -1;
+
+    // part 3 stuff
+
+    /*
+    drop all capabilities
+    remove access to setuid so that we cannot get capabilities back
+    
+    Obliterate the permissions
+    */
+    for (int cap = 0; cap <= CAP_LAST_CAP; cap++) {
+        prctl(PR_CAPBSET_DROP, cap, 0, 0, 0);
+    }
+
+    struct __user_cap_header_struct hdr = {
+        .version = _LINUX_CAPABILITY_VERSION_3,
+        .pid = 0
+    };
+    struct __user_cap_data_struct data[2] = {{0}};
+    if (syscall(SYS_capset, &hdr, data) < 0) {
+        perror("capset");
+        return -1;
+    }
+    if (container_seccomp() < 0) return -1;
     
     return 0;
 }
@@ -170,40 +294,28 @@ int container_network(void)
      * and ioctl(SIOCSIFFLAGS) to set them. Best-effort: this needs CAP_NET_ADMIN,
      * so call it before dropping capabilities. */
     
-    // TODO are we supposed to do includes for the ifreq and netdevice function
-    int capset(cap_user_header_t hdrp, const cap_user_data_t datap);
-    
-    int pid = getpid();
-    if(pid == -1){
-        return -1; 
-    }
-
-    struct cap_user_header_t perms = {.version = _LINUX_CAPABILITY_VERSION_2, .pid = pid};
-    int res = capset(CAP_NET_ADMIN);
-
-    // unsure about above code
-    
     int sock = socket(AF_INET, SOCK_DGRAM, 0);
     if (sock < 0) {
-        return -1;
+        perror("container: loopback");
+        return 0;
     }
     struct ifreq f;
     memset(&f,  0, sizeof(struct ifreq));
     strncpy(f.ifr_name, "lo", IFNAMSIZ - 1);
  
-    if (ioctl(sock, SIOCGIFFLAGS, &f) == 0) { 
-        f.ifr_flags |= IFF_UP | IFF_RUNNING;
-        if (ioctl(sock, SIOCSIFFLAGS, &f) < 0) {
-            close(sock);
-            return -1;
-        }
-    }
-    else{
+    if (ioctl(sock, SIOCGIFFLAGS, &f) < 0) 
+    {
+        perror("container: loopback");
         close(sock);
-        return -1;
+        return 0;
+    }
+    f.ifr_flags |= IFF_UP | IFF_RUNNING;
+    if (ioctl(sock, SIOCSIFFLAGS, &f) < 0){
+        perror("container: loopback");
+        close(sock);
+        return 0;
     }
     close(sock);
-
     return 0;
 }
 
@@ -220,27 +332,58 @@ int container_net_config(struct container *c)
      *     (rt_dst/rt_genmask 0.0.0.0, rt_gateway = c->net_gw,
      *     rt_flags = RTF_UP | RTF_GATEWAY) and ioctl(SIOCADDRT).
      * Needs CAP_NET_ADMIN, so container_setup() calls this before the cap drop. */
-    struct ifreq f; 
-    memset(&f, 0, sizeof(struct ifreq));
+    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock < 0) return -1;
+
+    struct ifreq f;
+    memset(&f, 0, sizeof f);
     strncpy(f.ifr_name, c->net_ifname, IFNAMSIZ - 1);
-    
-    
-    struct sockaddr_in *addr = (struct sockaddr_int*) &f.ifr_addr;
-    addr->sin_family = AF_INET;
+    struct sockaddr_in *sin = (struct sockaddr_in *)&f.ifr_addr;
 
-    
+    sin->sin_family = AF_INET;
+    if (inet_pton(AF_INET, c->net_ip, &sin->sin_addr) != 1) goto fail;
+    if (ioctl(sock, SIOCSIFADDR, &f) < 0) goto fail;
 
-    if (ioctl(sock, SIOCSIFADDR, &f) == 0) { 
-        return -1;
-    }
-    else{
-        close(sock);
-        return -1;
-    }
+    /*
+    net_prefix is the subnet prefix len
+    if there is a prefix then we set it accordingly, otherwise we set it to 0
+    
+    htonl converts from current int to network representable long
+    (32 - c->net_prefix) tells us how much space to allocate on the bottom of the
+    address for the submask
+    ~0u is just masking the top bits with 1s
+    that result is the mask for the subnet addr
+    */
+    sin->sin_addr.s_addr = c->net_prefix ? htonl(~0u << (32 - c->net_prefix)) : 0;
+    if (ioctl(sock, SIOCSIFNETMASK, &f) < 0) goto fail;
+
+    if (ioctl(sock, SIOCGIFFLAGS, &f) < 0) goto fail;
+    f.ifr_flags |= IFF_UP | IFF_RUNNING;
+    if (ioctl(sock, SIOCSIFFLAGS, &f) < 0) goto fail;
+
+    /*
+    1. Create an empty routing table entry.
+    2. Set the destination and netmask as IPv4.
+    3. Set the gateway as IPv4.
+    4. Convert the gateway IP from text to binary.
+    5. Mark the route as active and using a gateway.
+    6. Add the route to the kernel routing table.    
+    */
+    struct rtentry rt;
+    memset(&rt, 0, sizeof rt);
+    ((struct sockaddr_in *)&rt.rt_dst)->sin_family = AF_INET;
+    ((struct sockaddr_in *)&rt.rt_genmask)->sin_family = AF_INET;
+    struct sockaddr_in *gw = (struct sockaddr_in *)&rt.rt_gateway;
+    gw->sin_family = AF_INET;
+    if (inet_pton(AF_INET, c->net_gw, &gw->sin_addr) != 1) goto fail;
+    rt.rt_flags = RTF_UP | RTF_GATEWAY;
+    if (ioctl(sock, SIOCADDRT, &rt) < 0) goto fail;
+
     close(sock);
-     // c->net_ifname
-
     return 0;
+fail:
+    close(sock);
+    return -1;
 }
 
 int container_seccomp(void)
@@ -258,6 +401,46 @@ int container_seccomp(void)
      *   3. otherwise return SECCOMP_RET_ALLOW.
      * Then prctl(PR_SET_NO_NEW_PRIVS, 1, ...) and
      * syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER, 0, &prog). */
+
+    static const int denied[] = {
+        __NR_ptrace, __NR_mount, __NR_umount2, __NR_pivot_root, __NR_chroot,
+        __NR_setns, __NR_unshare, __NR_reboot, __NR_swapon, __NR_swapoff,
+        __NR_kexec_load, __NR_init_module, __NR_finit_module, __NR_delete_module,
+    };
+    enum { N = sizeof denied / sizeof denied[0] };
+
+    struct sock_filter filter[4 + 2 * N + 1];
+    int i = 0;
+
+    /* reject a foreign ABI */
+    // loading syscall architecture data
+    filter[i++] = (struct sock_filter)BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                      offsetof(struct seccomp_data, arch));
+    // compare with our expected architecture
+    filter[i++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K,
+                      SECCOMP_ARCH, 1, 0);            /* match: skip the kill */
+    // if they dont match we kill process
+    filter[i++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K,
+                      SECCOMP_RET_KILL_PROCESS);
+
+    /* for each denied syscall, return EPERM */
+    // blacklisting syscalls
+    filter[i++] = (struct sock_filter)BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                      offsetof(struct seccomp_data, nr));
+    for (int j = 0; j < N; j++) {
+        filter[i++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K,
+                          (unsigned)denied[j], 0, 1); /* no match: skip the RET */
+        filter[i++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K,
+                          SECCOMP_RET_ERRNO | (EPERM & SECCOMP_RET_DATA));
+    }
+
+    /* allow everything else */
+    filter[i++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW);
+
+    struct sock_fprog prog = { .len = (unsigned short)i, .filter = filter };
+
+    if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0) return -1;
+    if (syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER, 0, &prog) < 0) return -1;
     return 0;
 }
 
@@ -276,10 +459,52 @@ int container_init(struct container *c)
      *      included). Stop when the command itself is reaped; return its exit
      *      status (WEXITSTATUS, or 128+signal if it was killed).
      * The value you return here is what the container exits with. */
-    return 0;
+    close(c->sync[1]);
+    char release;
+    if (read(c->sync[0], &release, 1) != 1) {
+        perror("container init: read sync");
+        return -1;
+    }
+    close(c->sync[0]);
+    if (container_setup(c) < 0) {
+        return -1;
+    }
+    pid_t cmd_pid = fork();
+    if (cmd_pid < 0) {
+        perror("container init: fork");
+        return -1;
+    }
+
+    if (cmd_pid == 0) {
+        execvp(c->argv[0], c->argv);
+        
+        perror("container init: execvp");
+        _exit(127);
+    }
+
+    int status;
+    int exit_status = -1;
+    pid_t reaped;
+    while ((reaped = waitpid(-1, &status, 0)) > 0) {
+        if (reaped == cmd_pid) {
+            if (WIFEXITED(status)) {
+                exit_status = WEXITSTATUS(status);
+            } else if (WIFSIGNALED(status)) {
+                exit_status = 128 + WTERMSIG(status);
+            }
+            break;
+        }
+    }
+
+    return exit_status;
 }
 
 /* ---- the whole lifecycle: main.c calls only this ----------------------- */
+
+static int child_entry(void *arg)
+{
+    return container_init((struct container *)arg);
+}
 
 int container_run(struct container *c)
 {
@@ -309,9 +534,63 @@ int container_run(struct container *c)
 
     /* Keep the "container: " prefix on anything you print here: the test
      * harness reads the container's output and skips lines starting with it. */
-    fprintf(stderr, "container: container_run() is not implemented yet, "
-                    "so nothing ran. See SPEC.md.\n");
-    return 1;
+    if (container_cgroup_init(c) < 0) return -1;
+    // make the C groups
+    if (pipe(c->sync) < 0) {
+        perror("container: pipe");
+        return -1;
+    }
+    // allocate stack and clone child proc into new namespaces
+    char *stack = malloc(CONTAINER_STACK_SIZE);
+    if (!stack) {
+        perror("container: malloc stack");
+        return -1;
+    }
+
+    pid_t child = clone(child_entry, stack + CONTAINER_STACK_SIZE, container_namespaces() | SIGCHLD, c);
+    if (child < 0) {
+        perror("container: clone");
+        free(stack);
+        return -1;
+    }
+
+    if (container_write_idmaps(c, child) < 0) return -1;
+
+    if (container_cgroup_enter(c, child) < 0) return -1;
+
+    if (c->net_enabled) {
+        if (container_net_host_setup(c, child) < 0) return -1;
+    }
+    
+    //part 4 
+    close(c->sync[0]);
+    char release = 1;
+    if (write(c->sync[1], &release, 1) != 1) {
+        perror("container: sync write");
+        return -1;
+    }
+    close(c->sync[1]);
+
+    int status;
+    if (waitpid(child, &status, 0) < 0) {
+        perror("container: waitpid");
+        return -1;
+    }
+
+    int exit_status = -1;
+    if (WIFEXITED(status)) {
+        exit_status = WEXITSTATUS(status);
+    } else if (WIFSIGNALED(status)) {
+        exit_status = 128 + WTERMSIG(status);
+    }
+
+    if (c->net_enabled) {
+        container_net_host_teardown(c);
+    }
+
+    container_cleanup(c);
+    free(stack);
+    return exit_status;
 }
 
 /* ---- Part VI: teardown ------------------------------------------------- */
@@ -322,5 +601,12 @@ int container_cleanup(struct container *c)
     /* TODO(student): the child (and its whole subtree) is already reaped, so its
      * cgroup is empty and its mount namespace is gone. Remove the cgroup
      * directory you created (rmdir c->cg_path). Tolerate it already being gone. */
+    if (rmdir(c->cg_path) < 0) {
+        // Tolerate ENOENT (No such file or directory) if it's already gone
+        if (errno != ENOENT) {
+            perror("container: rmdir cgroup");
+            return -1;
+        }
+    }
     return 0;
 }
