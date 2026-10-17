@@ -19,6 +19,9 @@
  * You can read them in the Unikraft source kraft fetched under
  * app/.unikraft/unikraft/.
  */
+#include <uk/init.h>
+#include <uk/alloc.h>
+#include <uk/plat/time.h>
 
 /* TODO(student): two variables at file scope (outside any function):
  *
@@ -26,6 +29,8 @@
  *     static unsigned long invocations;  the counter
  *
  * __nsec is Unikraft's type for nanoseconds (a 64-bit unsigned integer). */
+ static __nsec boot_ns;
+ static unsigned long invocations;
 
 /* TODO(student) 1: the boot hook.
  *
@@ -43,6 +48,14 @@
  *     uk_late_initcall(your_function, 0);
  *
  * To print a 64-bit value with %lu, cast it: (unsigned long)(boot_ns / 1000000). */
+ static int ukstats_boot(void) {
+    boot_ns = ukplat_monotonic_clock();
+    printf("1 unikernel booted in %lu ms\n",
+        (unsigned long)(boot_ns / 1000000));
+    return 0;
+ }
+
+uk_late_initcall(ukstats_boot, 0);
 
 /* TODO(student) 2: count invocations.
  *
@@ -50,6 +63,10 @@
  *
  * The runner calls this after each successful RUN. Add 1 to invocations. You
  * do not need `fn`. */
+ void runner_on_invoke(const char *fn) {
+    (void) fn;
+    invocations++;
+ }
 
 /* TODO(student) 3: answer INFO.
  *
@@ -66,3 +83,14 @@
  *   - invocations: your counter.
  *
  * Cast each number to long or unsigned long so it matches %ld or %lu. */
+
+int runner_platform_info(char *out, size_t n) {
+    struct uk_alloc *a = uk_alloc_get_default();
+    long freemem = (a == NULL) ? -1L : (long) uk_alloc_availmem(a);
+    unsigned long uptime_ms = (unsigned long) (ukplat_monotonic_clock() / 1000000);
+    unsigned long boot_ms = (unsigned long)(boot_ns / 1000000);
+
+    snprintf(out, n, "platform=unikraft freemem=%ld uptime_ms=%lu boot_ms=%lu invocations=%lu", freemem, uptime_ms, boot_ms, invocations);
+    return 0;
+    
+}

@@ -11,13 +11,13 @@ name: runner
 
 # TODO(student): the Unikraft core.
 #   Give it `version: stable`, and turn on:
-#       CONFIG_LIBNOLIBC=y      a small C library, enough for runner.c
-#       CONFIG_LIBUKSCHED=y     a thread scheduler...
-#       CONFIG_LIBUKSCHEDCOOP=y ...which the network library (lwip) needs
-# unikraft:
-#   version: stable
-#   kconfig:
-#     - ...
+
+unikraft:
+  version: stable
+  kconfig:
+    - CONFIG_LIBNOLIBC=y      # a small C library, enough for runner.c
+    - CONFIG_LIBUKSCHED=y     # a thread scheduler...
+    - CONFIG_LIBUKSCHEDCOOP=y # which the network library (lwip) needs
 
 targets:
   - architecture: x86_64
@@ -29,18 +29,17 @@ targets:
 #
 #   runner.c is a TCP server, so the unikernel needs a network library: `lwip`
 #   (version: stable). Turn on these options:
-#
-#       CONFIG_LWIP_UKNETDEV=y     bind to the virtio network device
-#       CONFIG_LWIP_TCP=y          TCP
-#       CONFIG_LWIP_THREADS=y      its own threads
-#       CONFIG_LWIP_SOCKET=y       the socket functions runner.c calls
-#       CONFIG_LWIP_AUTOIFACE=y    bring the interface up automatically
-#       CONFIG_LWIP_IPV4=y         IPv4
-#       CONFIG_LWIP_DHCP=y         take an address from QEMU's DHCP server
-#       CONFIG_LWIP_SOCKET_PPOLL=n
-#
-# libraries:
-#   lwip:
-#     version: stable
-#     kconfig:
-#       - ...
+
+
+libraries:
+  lwip:
+    version: stable
+    kconfig:
+        - CONFIG_LWIP_UKNETDEV=y     # bind to the virtio network device
+        - CONFIG_LWIP_TCP=y          # TCP
+        - CONFIG_LWIP_THREADS=y      # its own threads
+        - CONFIG_LWIP_SOCKET=y       # the socket functions runner.c calls
+        - CONFIG_LWIP_AUTOIFACE=y    # bring the interface up automatically
+        - CONFIG_LWIP_IPV4=y         # IPv4
+        - CONFIG_LWIP_DHCP=y         # take an address from QEMU's DHCP server
+        - CONFIG_LWIP_SOCKET_PPOLL=n

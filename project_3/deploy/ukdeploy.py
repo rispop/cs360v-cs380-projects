@@ -109,6 +109,10 @@ def reap_dead(state):
 
     Do not delete from a dict while looping over it: collect the dead names
     first (e.g. in a list), then delete them."""
+
+    dead = [name for name, entry in state["instances"].items() if not alive(entry["pid"])]
+    for instance in dead:
+        del state["instances"][instance]
     return state
 
 
@@ -124,8 +128,14 @@ def port_free(port):
     If bind() raises OSError, the port is in use: return False. Otherwise
     return True. SO_REUSEADDR makes a port that was just released by a stopped
     instance count as free."""
-    return True
-
+    
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                s.bind(("127.0.0.1", port))
+        return True
+    except OSError:
+        return False
 
 def pick_port(state):
     """TODO(student) Part II: return a free port for a new instance, or None.
@@ -135,6 +145,11 @@ def pick_port(state):
       - not the "port" of any entry in state["instances"], and
       - free according to port_free().
     Return None if no port qualifies."""
+    used_ports = {instance["port"] for instance in state["instances"].values()}
+    for port in range(*PORT_RANGE):
+        if port not in used_ports and port_free(port):
+            return port
+    
     return None
 
 
@@ -146,7 +161,15 @@ def ping(port, timeout=2.0):
       3. Read the reply with recv(64). Return True if it contains b"PONG".
 
     If any step raises OSError (refused, timed out, closed), return False."""
-    return False
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=timeout) as s:
+            s.sendall(b"PING\n")
+            reply = s.recv(64)
+            if b"PONG" in reply:
+                return True
+            return False
+    except OSError:
+        return False
 
 
 def wait_ready(port, pid, timeout=READY_TIMEOUT):
@@ -157,8 +180,15 @@ def wait_ready(port, pid, timeout=READY_TIMEOUT):
       - if ping(port) is True, return True;
       - otherwise time.sleep(0.3) and try again.
     Return False if the time runs out."""
-    return False
-
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if not alive(pid):
+            return False
+        if ping(port):
+            return True
+        time.sleep(0.3)
+    return False 
+    
 
 def cmd_build(args):
     """TODO(student) Part I: build the unikernel image. Do this one first.
@@ -190,8 +220,65 @@ def cmd_build(args):
     Your return value becomes the exit status of `./deploy/ukdeploy.py build`.
     To check it, run that command: on success, the image is under
     app/.unikraft/build/. SPEC.md Part I explains why the two flags are needed."""
-    print("TODO: implement build")
-    return 1
+    if shutil.which("kraft") is None:
+        print("error")
+        return 1
+    
+    argv = ["kraft", "build", "--plat", "qemu", "--arch", args.arch, "--no-update", "--no-prompt", "-j", str(os.cpu_count())]
+    result = subprocess.run(argv, cwd=APP_DIR)
+    if result.returncode != 0:
+        print("error")
+        return 1
+    image = find_image(args.arch)
+    if image is None:
+        print("Error")
+        return 1
+
+    print(image)
+    return 0
+
+def deploy_helper(img, arch, port, name):
+    spec = ARCHES[arch]
+
+    if arch == host_arch() and os.access("/dev/kvm", os.R_OK | os.W_OK):
+        kvm = ["-enable-kvm", "-cpu", spec["cpu"]]
+    else:
+        kvm = ["-cpu", spec["fallback_cpu"]]
+
+    extra = spec.get("extra", [])
+
+    argv = [
+        spec["qemu"], "-kernel", img, "-nographic", "-no-reboot",
+        "-m", "128M", *kvm, *extra, "-netdev",
+        f"user,id=n0,hostfwd=tcp::{port}-:{RUNNER_PORT}",
+        "-device", "virtio-net-pci,netdev=n0"
+    ]
+
+    try:
+        os.makedirs(LOG_DIR, exist_ok=True)
+        log_path = os.path.join(LOG_DIR, f"{name}.log")
+
+        with open(log_path, "wb") as log:
+            proc = subprocess.Popen(
+                argv, stdout=log, stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
+                start_new_session=True
+            )
+    except OSError as e:
+        print(f"error: could not start QEMU: {e}", file=sys.stderr)
+        return None
+
+    if not wait_ready(port, proc.pid):
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except OSError:
+            pass
+
+        proc.wait()
+        print(f"error: instance failed to become ready (see {log_path})", file=sys.stderr)
+        return None
+
+    return proc, log_path
 
 
 def cmd_deploy(args):
@@ -242,8 +329,63 @@ def cmd_deploy(args):
 
     bench (Part IV) also boots instances, so you may want to put steps 5 to 7
     in a helper function that both can call."""
-    print("TODO: implement deploy")
-    return 1
+    state = reap_dead(load_state())
+    img = find_image(args.arch)
+
+    if img is None:
+        print("error: run ukdeploy.py build first", file=sys.stderr)
+        return 1
+
+    if args.name is None:
+        num = 1
+        name = f"runner{num}"
+
+        while name in state["instances"]:
+            num += 1
+            name = f"runner{num}"
+    else:
+        if args.name in state["instances"]:
+            print(f"error: instance {args.name} already exists", file=sys.stderr)
+            return 1
+        name = args.name
+
+    used_ports = {entry["port"] for entry in state["instances"].values()}
+
+    if args.port is not None:
+        if not PORT_RANGE[0] <= args.port < PORT_RANGE[1]:
+            print("error: port outside valid range", file=sys.stderr)
+            return 1
+
+        if args.port in used_ports or not port_free(args.port):
+            print(f"error: port {args.port} is already in use", file=sys.stderr)
+            return 1
+
+        port = args.port
+    else:
+        port = pick_port(state)
+        if port is None:
+            print("error: no free ports available", file=sys.stderr)
+            return 1
+
+    result = deploy_helper(img, args.arch, port, name)
+
+    if result is None:
+        return 1
+
+    proc, log_path = result
+
+    state["instances"][name] = {
+        "pid": proc.pid,
+        "port": port,
+        "image": img,
+        "log": log_path,
+        "arch": args.arch,
+        "started": time.time()
+    }
+
+    save_state(state)
+    print(f"deployed {name}  port={port}  pid={proc.pid}")
+    return 0
 
 
 def cmd_bench(args):
@@ -272,8 +414,60 @@ def cmd_bench(args):
 
     If you put cmd_deploy's steps 5 to 7 in a helper function, call it here
     instead of copying them."""
-    print("TODO: implement bench")
-    return 1
+    
+    img = find_image(args.arch)
+
+    if img is None:
+        print("error: run ukdeploy.py build first", file=sys.stderr)
+        return 1
+
+    if args.count <= 0:
+        print("error: count must be positive", file=sys.stderr)
+        return 1
+
+    times = []
+
+    for i in range(args.count):
+        state = reap_dead(load_state())
+        port = pick_port(state)
+
+        if port is None:
+            print("error: no free ports available", file=sys.stderr)
+            return 1
+
+        name = f"bench_{i}"
+
+        start = time.time()
+        result = deploy_helper(img, args.arch, port, name)
+
+        if result is None:
+            return 1
+
+        proc, log_path = result
+        elapsed = time.time() - start
+
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except OSError:
+            pass
+
+        proc.wait()
+        times.append(elapsed)
+
+    times.sort()
+
+    n = len(times)
+    p50 = (times[(n - 1) // 2] + times[n // 2]) / 2
+    rmax = times[-1]
+    img_size = os.path.getsize(img)
+
+    print(f"image      {img}")
+    print(f"image_size {img_size}")
+    print(f"runs       {args.count}")
+    print(f"ready_p50  {p50:.4f}")
+    print(f"ready_max  {rmax:.4f}")
+
+    return 0
 
 
 def cmd_list(args):
@@ -292,8 +486,25 @@ def cmd_list(args):
 
         [{"name": name, **entry} for name, entry in state["instances"].items()]
     """
-    print("TODO: implement list")
-    return 1
+    state = reap_dead(load_state())
+    save_state(state)
+    if args.json:
+        items = [
+            {"name": name, **entry}
+            for name, entry in state["instances"].items()
+        ]
+        print(json.dumps(items))
+        return 0
+    if not state["instances"]:
+        print("no instances")
+        return 0
+
+    for name, entry in state["instances"].items():
+        status="yes" if ping(entry['port']) else "no"
+        print(f"{name}  port={entry['port']}  pid={entry['pid']}  "f"ready={status}  log={entry['log']}")
+
+    return 0
+    
 
 
 def cmd_stop(args):
@@ -311,9 +522,33 @@ def cmd_stop(args):
          have exited already.
       4. Delete each stopped instance from state["instances"], then
          save_state(state). Return 0."""
-    print("TODO: implement stop")
-    return 1
-
+    state = load_state()
+    if args.all:
+        instances = list(state['instances'])
+    elif args.name is None or args.name not in state["instances"]:
+        print("error: instance not found", file=sys.stderr)
+        return 1
+    else: 
+        instances = [args.name]
+    for instance in instances:
+        pid = state["instances"][instance]["pid"]
+        try:
+            os.killpg(os.getpgid(pid), signal.SIGTERM)
+        except OSError:
+            pass
+        for i in range(20):
+            if not alive(pid):
+                break
+            time.sleep(0.1)
+        if alive(pid):
+            try: 
+                os.killpg(os.getpgid(pid), signal.SIGKILL)
+            except OSError:
+                pass
+        del state["instances"][instance]
+    
+    save_state(state)
+    return 0
 
 # ---- command line (PROVIDED) ---------------------------------------------
 
